@@ -1,0 +1,14 @@
+com\lspgroup\fleet\OptimizationService.class
+com\lspgroup\fleet\RouteAssignment.class
+com\lspgroup\fleet\FleetConstraintProvider.class
+com\lspgroup\fleet\Constants.class
+com\lspgroup\fleet\FleetOptimizationSystem.class
+com\lspgroup\fleet\LocationDistance.class
+com\lspgroup\fleet\FleetSolution.class
+com\lspgroup\fleet\OvermileageDetail.class
+com\lspgroup\fleet\Vehicle.class
+com\lspgroup\fleet\CostBreakdown.class
+com\lspgroup\fleet\FleetController.class
+com\lspgroup\fleet\MongoService.class
+com\lspgroup\fleet\OptimizationResult.class
+com\lspgroup\fleet\RepositioningDetail.class
