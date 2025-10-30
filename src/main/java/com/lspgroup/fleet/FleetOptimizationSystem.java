@@ -1,6 +1,7 @@
 package com.lspgroup.fleet;
 
 import com.mongodb.client.*;
+import com.mongodb.client.model.ReplaceOptions;
 import lombok.Data;
 import org.bson.Document;
 import org.optaplanner.core.api.domain.entity.PlanningEntity;
@@ -113,6 +114,10 @@ class Vehicle {
         int interval = getServiceInterval();
         return kmSinceService >= interval;
     }
+
+    public Map<String, LocationDistance> getDistances() {
+        return new HashMap<>();
+    }
 }
 
 @Data
@@ -210,6 +215,10 @@ class MongoService {
     public MongoService(String uri, String dbName) {
         this.mongoClient = MongoClients.create(uri);
         this.database = mongoClient.getDatabase(dbName);
+    }
+
+    public MongoDatabase getDatabase() {
+        return database;
     }
 
     private int safeParseInt(Object obj, int defaultValue) {
@@ -350,6 +359,256 @@ class MongoService {
 
         System.out.println("✅ Loaded " + map.size() + " location distances");
         return map;
+    }
+}
+
+// ==================== VALIDATION SERVICE ====================
+
+@Data
+class ValidationResult {
+    boolean valid;
+    List<String> errors;
+    List<String> warnings;
+
+    public ValidationResult(boolean valid, List<String> errors, List<String> warnings) {
+        this.valid = valid;
+        this.errors = errors;
+        this.warnings = warnings;
+    }
+
+    public void printReport() {
+        if (valid) {
+            System.out.println("✅ VALIDATION PASSED");
+        } else {
+            System.out.println("❌ VALIDATION FAILED");
+        }
+
+        if (!errors.isEmpty()) {
+            System.out.println("\n🚨 ERRORS:");
+            for (String error : errors) {
+                System.out.println("  ❌ " + error);
+            }
+        }
+
+        if (!warnings.isEmpty()) {
+            System.out.println("\n⚠️  WARNINGS:");
+            for (String warning : warnings) {
+                System.out.println("  ⚠️  " + warning);
+            }
+        }
+    }
+}
+
+class OptimizationValidator {
+
+    public ValidationResult validate(OptimizationResult result, String month) {
+        List<String> errors = new ArrayList<>();
+        List<String> warnings = new ArrayList<>();
+
+        if (result.getSolution() == null) {
+            errors.add("Solution is null");
+            return new ValidationResult(false, errors, warnings);
+        }
+
+        // 1. Sprawdź czy wszystkie trasy przypisane
+        long unassigned = result.getSolution().getAssignments().stream()
+                .filter(a -> a.getVehicle() == null)
+                .count();
+
+        if (unassigned > 0) {
+            errors.add("CRITICAL: " + unassigned + " routes NOT assigned!");
+        }
+
+        // 2. Sprawdź limity kilometrów
+        Map<Integer, Double> vehicleKm = new HashMap<>();
+        for (RouteAssignment a : result.getSolution().getAssignments()) {
+            if (a.getVehicle() == null) continue;
+            vehicleKm.merge(a.getVehicle().getId(), a.getDistanceKm(), Double::sum);
+        }
+
+        for (Vehicle v : result.getSolution().getVehicles()) {
+            double routeKm = vehicleKm.getOrDefault(v.getId(), 0.0);
+            int totalKm = v.getCurrentYearKm() + (int) routeKm;
+            int proportionalLimit = v.getProportionalLimit();
+            int maxAllowed = v.getMaxAllowedKm();
+
+            // Sprawdź przekroczenie +300 km
+            if (totalKm > maxAllowed) {
+                int overage = totalKm - maxAllowed;
+                errors.add("CRITICAL: Vehicle " + v.getRegistration() +
+                        " EXCEEDS limit by " + overage + "km " +
+                        "(total: " + totalKm + "km, max: " + maxAllowed + "km)");
+            }
+
+            // Ostrzeżenie gdy blisko limitu
+            if (totalKm > proportionalLimit && totalKm <= maxAllowed) {
+                int overage = totalKm - proportionalLimit;
+                warnings.add("Vehicle " + v.getRegistration() +
+                        " in overmileage: +" + overage + "km " +
+                        "(total: " + totalKm + "km, limit: " + proportionalLimit + "km)");
+            }
+        }
+
+        // 3. Sprawdź serwisy
+        for (Vehicle v : result.getSolution().getVehicles()) {
+            double routeKm = vehicleKm.getOrDefault(v.getId(), 0.0);
+            int newOdometer = v.getCurrentOdometerKm() + (int) routeKm;
+            int kmSinceService = newOdometer - v.getLastServiceKm();
+            int serviceInterval = v.getServiceInterval();
+
+            // Przekroczenie interwału serwisowego
+            if (kmSinceService > serviceInterval + Constants.SERVICE_TOLERANCE_KM) {
+                errors.add("CRITICAL: Vehicle " + v.getRegistration() +
+                        " EXCEEDS service interval by " +
+                        (kmSinceService - serviceInterval) + "km " +
+                        "(since last: " + kmSinceService + "km, interval: " +
+                        serviceInterval + "km)");
+            }
+
+            // Ostrzeżenie - zbliża się serwis
+            if (kmSinceService > serviceInterval - Constants.SERVICE_TOLERANCE_KM &&
+                    kmSinceService <= serviceInterval) {
+                warnings.add("Vehicle " + v.getRegistration() +
+                        " approaching service in " +
+                        (serviceInterval - kmSinceService) + "km");
+            }
+        }
+
+        // 4. Sprawdź score
+        if (!result.getScore().contains("0hard")) {
+            errors.add("HARD constraints violated! Score: " + result.getScore());
+        }
+
+        boolean isValid = errors.isEmpty();
+
+        return new ValidationResult(isValid, errors, warnings);
+    }
+}
+
+// ==================== RESULT SAVING SERVICE ====================
+
+class OptimizationResultSaver {
+    private final MongoDatabase database;
+    private final OptimizationValidator validator;
+
+    public OptimizationResultSaver(MongoDatabase database) {
+        this.database = database;
+        this.validator = new OptimizationValidator();
+    }
+
+    public boolean saveResult(String month, String startDate, int days, OptimizationResult result) {
+        // WALIDACJA PRZED ZAPISEM
+        System.out.println("\n🔍 Validating result for " + month + "...");
+        ValidationResult validation = validator.validate(result, month);
+        validation.printReport();
+
+        // NIE ZAPISUJ jeśli są błędy krytyczne!
+        if (!validation.valid) {
+            System.out.println("❌ Result NOT saved due to validation errors!");
+            return false;
+        }
+
+        MongoCollection<Document> collection = database.getCollection("optimization_results_2025");
+
+        // Przygotuj dane statystyczne
+        long assignedRoutes = result.getSolution().getAssignments().stream()
+                .filter(a -> a.getVehicle() != null)
+                .count();
+
+        Set<Integer> usedVehicles = result.getSolution().getAssignments().stream()
+                .filter(a -> a.getVehicle() != null)
+                .map(a -> a.getVehicle().getId())
+                .collect(Collectors.toSet());
+
+        double totalKm = result.getSolution().getAssignments().stream()
+                .filter(a -> a.getVehicle() != null)
+                .mapToDouble(RouteAssignment::getDistanceKm)
+                .sum();
+
+        // Przygotuj dokument
+        Document doc = new Document()
+                .append("month", month)
+                .append("period", new Document()
+                        .append("start_date", startDate)
+                        .append("end_date", LocalDate.parse(startDate).plusDays(days - 1).toString())
+                        .append("days", days))
+                .append("timestamp", LocalDateTime.now().toString())
+                .append("status", result.getStatus())
+                .append("score", result.getScore())
+                .append("computation_time_sec", result.getComputationTimeSeconds())
+                .append("validation", new Document()
+                        .append("valid", validation.valid)
+                        .append("errors", validation.errors)
+                        .append("warnings", validation.warnings));
+
+        // Koszty
+        if (result.getCosts() != null) {
+            CostBreakdown costs = result.getCosts();
+            doc.append("costs", new Document()
+                    .append("total_cost_PLN", costs.totalCost)
+                    .append("repositioning_cost_PLN", costs.totalRepositioningCost)
+                    .append("overmileage_cost_PLN", costs.totalOvermileageCost));
+
+            // Repositioning details
+            List<Document> repoDetails = costs.repositioningDetails.stream()
+                    .map(d -> new Document()
+                            .append("route_id", d.routeId)
+                            .append("vehicle_id", d.vehicleId)
+                            .append("vehicle_registration", d.vehicleRegistration)
+                            .append("from_location", d.fromLocationId)
+                            .append("to_location", d.toLocationId)
+                            .append("cost_PLN", d.cost))
+                    .collect(Collectors.toList());
+            doc.append("repositioning_details", repoDetails);
+
+            // Overmileage details
+            List<Document> overmileageDetails = costs.overmileageDetails.stream()
+                    .map(d -> new Document()
+                            .append("vehicle_id", d.vehicleId)
+                            .append("vehicle_registration", d.vehicleRegistration)
+                            .append("total_km", d.totalKm)
+                            .append("annual_limit_km", d.annualLimit)
+                            .append("max_allowed_km", d.maxAllowed)
+                            .append("overage_km", d.overageKm)
+                            .append("cost_PLN", d.cost)
+                            .append("severity", d.severity))
+                    .collect(Collectors.toList());
+            doc.append("overmileage_details", overmileageDetails);
+        }
+
+        // Statystyki
+        doc.append("statistics", new Document()
+                .append("total_routes", result.getSolution().getAssignments().size())
+                .append("assigned_routes", assignedRoutes)
+                .append("unassigned_routes", result.getSolution().getAssignments().size() - assignedRoutes)
+                .append("vehicles_used", usedVehicles.size())
+                .append("total_km", totalKm)
+                .append("repositioning_count", result.getCosts() != null ?
+                        result.getCosts().repositioningDetails.size() : 0));
+
+        // Assignments
+        List<Document> assignments = result.getSolution().getAssignments().stream()
+                .filter(a -> a.getVehicle() != null)
+                .map(a -> new Document()
+                        .append("route_id", a.getRouteId())
+                        .append("vehicle_id", a.getVehicle().getId())
+                        .append("vehicle_registration", a.getVehicle().getRegistration())
+                        .append("start_location", a.getStartLocationId())
+                        .append("end_location", a.getEndLocationId())
+                        .append("distance_km", a.getDistanceKm())
+                        .append("start_time", a.getStartTime().toString())
+                        .append("end_time", a.getEndTime().toString()))
+                .collect(Collectors.toList());
+        doc.append("assignments", assignments);
+
+        // Zapisz do bazy
+        collection.replaceOne(
+                new Document("month", month),
+                doc,
+                new ReplaceOptions().upsert(true));
+
+        System.out.println("💾 Saved optimization result for " + month + " to MongoDB");
+        return true;
     }
 }
 
@@ -505,6 +764,144 @@ class OptimizationService {
 
         return costs;
     }
+
+    private void updateVehicleStates(List<Vehicle> vehicles, OptimizationResult previousMonth) {
+        if (previousMonth == null || previousMonth.getSolution() == null) {
+            return;
+        }
+
+        System.out.println("🔄 Updating vehicle states from previous month...");
+
+        Map<Integer, Double> vehicleKm = new HashMap<>();
+        Map<Integer, Integer> vehicleEndLocation = new HashMap<>();
+
+        for (RouteAssignment a : previousMonth.getSolution().getAssignments()) {
+            if (a.getVehicle() == null) continue;
+
+            vehicleKm.merge(a.getVehicle().getId(), a.getDistanceKm(), Double::sum);
+            vehicleEndLocation.put(a.getVehicle().getId(), a.getEndLocationId());
+        }
+
+        for (Vehicle v : vehicles) {
+            double monthKm = vehicleKm.getOrDefault(v.getId(), 0.0);
+            v.setCurrentYearKm(v.getCurrentYearKm() + (int) monthKm);
+            v.setCurrentOdometerKm(v.getCurrentOdometerKm() + (int) monthKm);
+
+            if (vehicleEndLocation.containsKey(v.getId())) {
+                v.setCurrentLocationId(vehicleEndLocation.get(v.getId()));
+            }
+
+            if (monthKm > 0) {
+                System.out.println("  📊 " + v.getRegistration() + ": +" +
+                        String.format("%.0f", monthKm) + "km " +
+                        "(year total: " + v.getCurrentYearKm() + "km, " +
+                        "odometer: " + v.getCurrentOdometerKm() + "km)");
+            }
+        }
+    }
+
+    public Map<String, Object> optimizeYear(int year, int timeoutPerMonth, String mongoUri, String mongoDb) {
+        List<Map<String, Object>> monthResults = new ArrayList<>();
+        double totalTime = 0;
+        int successCount = 0;
+        int failCount = 0;
+
+        System.out.println("🚀 Starting year optimization for " + year);
+
+        MongoService yearMongoService = new MongoService(mongoUri, mongoDb);
+        OptimizationResultSaver saver = new OptimizationResultSaver(yearMongoService.getDatabase());
+
+        List<Vehicle> vehicles = yearMongoService.loadVehicles();
+
+        OptimizationResult previousResult = null;
+
+        String[] months = {"01", "02", "03", "04", "05", "06",
+                "07", "08", "09", "10", "11", "12"};
+
+        for (String month : months) {
+            String monthKey = year + "-" + month;
+            String startDate = year + "-" + month + "-01";
+
+            LocalDate firstDay = LocalDate.parse(startDate);
+            int daysInMonth = firstDay.lengthOfMonth();
+
+            System.out.println("\n" + "=".repeat(60));
+            System.out.println("📅 Optimizing " + monthKey + " (" + daysInMonth + " days)");
+            System.out.println("=".repeat(60));
+
+            if (previousResult != null) {
+                updateVehicleStates(vehicles, previousResult);
+            }
+
+            long monthStartTime = System.currentTimeMillis();
+
+            List<RouteAssignment> routes = yearMongoService.loadRoutes(startDate, daysInMonth);
+            Map<String, LocationDistance> distances = yearMongoService.loadLocationDistances();
+
+            FleetSolution problem = new FleetSolution(vehicles, routes, distances);
+
+            FleetSolution solution;
+            try {
+                SolverJob<FleetSolution, Long> job = solverManager.solve(
+                        (long) Integer.parseInt(month), problem);
+                solution = job.getFinalBestSolution();
+            } catch (Exception e) {
+                System.out.println("❌ Optimization FAILED for " + monthKey + ": " + e.getMessage());
+                failCount++;
+                continue;
+            }
+
+            double monthTime = (System.currentTimeMillis() - monthStartTime) / 1000.0;
+            totalTime += monthTime;
+
+            CostBreakdown costs = calculateCosts(solution);
+
+            OptimizationResult result = new OptimizationResult(
+                    solution.getScore().isFeasible() ? "OPTIMAL" : "INFEASIBLE",
+                    solution.getScore().toString(),
+                    solution,
+                    costs,
+                    monthTime);
+
+            boolean saved = saver.saveResult(monthKey, startDate, daysInMonth, result);
+
+            if (saved) {
+                successCount++;
+                previousResult = result;
+            } else {
+                failCount++;
+            }
+
+            monthResults.add(Map.of(
+                    "month", monthKey,
+                    "status", result.getStatus(),
+                    "saved", saved,
+                    "score", result.getScore(),
+                    "computation_time_sec", monthTime,
+                    "total_cost_PLN", costs.totalCost,
+                    "assigned_routes", solution.getAssignments().stream()
+                            .filter(a -> a.getVehicle() != null).count()));
+
+            System.out.println("✅ " + monthKey + " completed in " +
+                    String.format("%.1f", monthTime) + "s");
+        }
+
+        System.out.println("\n" + "=".repeat(60));
+        System.out.println("🎉 Year optimization completed!");
+        System.out.println("  ✅ Success: " + successCount + " months");
+        System.out.println("  ❌ Failed: " + failCount + " months");
+        System.out.println("  ⏱️  Total time: " + String.format("%.1f", totalTime / 60.0) + " minutes");
+        System.out.println("=".repeat(60));
+
+        return Map.of(
+                "status", failCount == 0 ? "SUCCESS" : "PARTIAL",
+                "year", year,
+                "success_count", successCount,
+                "fail_count", failCount,
+                "total_computation_time_sec", totalTime,
+                "total_computation_time_min", totalTime / 60.0,
+                "months", monthResults);
+    }
 }
 
 // ==================== RESULT DTOs ====================
@@ -595,10 +992,11 @@ class OvermileageDetail {
 class FleetController {
 
     private final OptimizationService optimizationService;
+    private final MongoService mongoService;
 
     public FleetController(@Value("${mongodb.uri}") String mongoUri,
                            @Value("${mongodb.database}") String mongoDb) {
-        MongoService mongoService = new MongoService(mongoUri, mongoDb);
+        this.mongoService = new MongoService(mongoUri, mongoDb);
         this.optimizationService = new OptimizationService(mongoService);
     }
 
@@ -606,22 +1004,22 @@ class FleetController {
     public Map<String, Object> root() {
         return Map.of(
                 "service", "LSP Fleet Optimization",
-                "version", "2.0.0",
+                "version", "3.0.0",
                 "solver", "OptaPlanner AI",
                 "features", List.of(
                         "✅ All routes MUST be assigned (priority #1)",
                         "✅ MAX 300km overmileage enforced",
-                        "✅ Repositioning cost optimization",
-                        "✅ Service intervals with ±1000km tolerance",
-                        "✅ Flexible swap cooldown (editable parameter)",
-                        "✅ Long-term lease support (>200k km)"));
+                        "✅ Service intervals: 110k-120k km ±1000km",
+                        "✅ Yearly optimization with validation",
+                        "✅ Automatic state updates between months",
+                        "✅ Results saved to MongoDB"));
     }
 
     @PostMapping("/optimize")
     public Map<String, Object> optimize(@RequestBody Map<String, Object> request) {
-        String startDate = (String) request.getOrDefault("start_date", "2024-01-01");
+        String startDate = (String) request.getOrDefault("start_date", "2025-01-01");
         int days = (int) request.getOrDefault("days", 30);
-        int timeout = (int) request.getOrDefault("timeout", 120);
+        int timeout = (int) request.getOrDefault("timeout", 300);
 
         OptimizationResult result = optimizationService.optimize(startDate, days, timeout);
 
@@ -669,7 +1067,6 @@ class FleetController {
                     "assigned_routes", assigned,
                     "unassigned_routes", result.getSolution().getAssignments().size() - assigned));
 
-            // NOWE: Dodaj szczegóły przypisań tras
             List<Map<String, Object>> assignmentDetails = result.getSolution().getAssignments().stream()
                     .filter(a -> a.getVehicle() != null)
                     .sorted((a, b) -> a.getStartTime().compareTo(b.getStartTime()))
@@ -691,6 +1088,48 @@ class FleetController {
         }
 
         return response;
+    }
+
+    @PostMapping("/optimize-year")
+    public Map<String, Object> optimizeYear(@RequestBody Map<String, Object> request) {
+        int year = (int) request.getOrDefault("year", 2025);
+        int timeoutPerMonth = (int) request.getOrDefault("timeout_per_month", 300);
+
+        return optimizationService.optimizeYear(year, timeoutPerMonth,
+                mongoService.getDatabase().getName(),
+                mongoService.getDatabase().getName());
+    }
+
+    @GetMapping("/results/{year}")
+    public Map<String, Object> getYearResults(@PathVariable int year) {
+        MongoCollection<Document> collection = mongoService.getDatabase()
+                .getCollection("optimization_results_2025");
+
+        List<Document> results = new ArrayList<>();
+        collection.find(new Document("month",
+                        new Document("$regex", "^" + year)))
+                .sort(new Document("month", 1))
+                .into(results);
+
+        return Map.of(
+                "year", year,
+                "total_months", results.size(),
+                "results", results);
+    }
+
+    @GetMapping("/results/{year}/{month}")
+    public Map<String, Object> getMonthResult(@PathVariable int year, @PathVariable String month) {
+        MongoCollection<Document> collection = mongoService.getDatabase()
+                .getCollection("optimization_results_2025");
+
+        String monthKey = year + "-" + month;
+        Document result = collection.find(new Document("month", monthKey)).first();
+
+        if (result == null) {
+            return Map.of("error", "No results found for " + monthKey);
+        }
+
+        return Map.of("month", monthKey, "result", result);
     }
 
     @GetMapping("/summary")
@@ -720,23 +1159,25 @@ class FleetController {
 public class FleetOptimizationSystem {
     public static void main(String[] args) {
         System.out.println("╔═══════════════════════════════════════════════════╗");
-        System.out.println("║   🚛 LSP FLEET OPTIMIZATION v2.0 - OptaPlanner  ║");
+        System.out.println("║   🚛 LSP FLEET OPTIMIZATION v3.0 - OptaPlanner  ║");
         System.out.println("╚═══════════════════════════════════════════════════╝");
         System.out.println();
         System.out.println("📋 Key Features:");
         System.out.println("  ✅ ALL routes MUST be assigned (hard constraint #1)");
-        System.out.println("  ✅ currentYearKm = 0 on 2024-01-01 (annual reset)");
-        System.out.println("  ✅ Service tolerance: ±1000 km");
-        System.out.println("  ✅ Long-term leases: >200k km = total lease limit");
-        System.out.println("  ✅ Flexible swap cooldown (editable parameter)");
+        System.out.println("  ✅ MAX 300km overmileage per vehicle per year");
+        System.out.println("  ✅ Service intervals: 110k-120k km (±1000km tolerance)");
+        System.out.println("  ✅ Yearly optimization with state tracking");
+        System.out.println("  ✅ Validation before saving to MongoDB");
         System.out.println();
         System.out.println("💰 Cost Structure:");
         System.out.println("  • Repositioning: 1000 PLN + 1 PLN/km + 150 PLN/h");
         System.out.println("  • Overmileage: 0.92 PLN/km (max 300km/vehicle/year)");
         System.out.println();
         System.out.println("🌐 API Endpoints:");
-        System.out.println("  POST /api/optimize - Run optimization");
-        System.out.println("  GET  /api/summary  - Configuration parameters");
+        System.out.println("  POST /api/optimize        - Single period optimization");
+        System.out.println("  POST /api/optimize-year   - Full year optimization");
+        System.out.println("  GET  /api/results/{year}  - Get year results");
+        System.out.println("  GET  /api/summary         - System configuration");
         System.out.println();
         System.out.println("Starting server...");
         System.out.println("═══════════════════════════════════════════════════");
