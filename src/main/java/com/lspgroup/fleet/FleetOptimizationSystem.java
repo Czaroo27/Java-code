@@ -126,7 +126,7 @@ class RouteAssignment {
     private LocalDateTime startTime;
     private LocalDateTime endTime;
 
-    @PlanningVariable(valueRangeProviderRefs = "vehicleRange", nullable = true)
+    @PlanningVariable(valueRangeProviderRefs = "vehicleRange", nullable = false)
     private Vehicle vehicle;
 
     public RouteAssignment() {}
